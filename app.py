@@ -9,6 +9,8 @@ ANALYSIS_KPI.md / KPI分析_完全引き継ぎプロンプト v3 のロジック
 """
 import io
 import datetime
+import re
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -509,6 +511,8 @@ PAYMENT_ERROR_STATUSES = ["与信保留", "与信審査エラー", "仮売上失
 
 def calculate_period_cancellation(
     df_orders_with_cohort: pd.DataFrame,
+    df_teiki: pd.DataFrame = None,
+    customer_master: pd.DataFrame = None,
     teiki_kaisu_col: str = "定期回数",
     order_month_col: str = "受注月",
     taiou_col: str = "対応状況",
@@ -516,13 +520,18 @@ def calculate_period_cancellation(
     shipped_date_col: str = "発送日",
     schedule_date_col: str = "発送予定日",
     update_date_col: str = "更新日",
+    customer_col: str = "顧客番号",
+    teiki_status_col: str = "ステータス",
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Returns:
         (result_df, notes)
         result_df columns:
-            登録月, 出荷件数, キャンセル件数, 決済保留エラー件数,
+            登録月, 出荷件数, キャンセル件数, 停止件数, 決済保留エラー件数,
             7日以内解約件数, 7日以内解約率, 14日以内解約件数, 14日以内解約率
+
+    停止件数：定期受注データ（df_teiki）の「ステータス＝停止」件数（定期回数=1のみ）。
+    df_teiki・customer_masterが渡されない場合は算出せず、Noneで埋める（注記あり）。
     """
     notes = []
     df = df_orders_with_cohort.copy()
@@ -549,11 +558,40 @@ def calculate_period_cancellation(
         first_orders["_更新日_dt"] - first_orders["_発送予定日_dt"]
     ).dt.days
 
+    # 停止件数（定期受注データから、定期回数=1×ステータス=停止を登録月別に集計）
+    stopped_by_month = None
+    if df_teiki is not None and not df_teiki.empty and customer_master is not None and not customer_master.empty:
+        required_teiki = [customer_col, teiki_status_col, teiki_kaisu_col]
+        missing_teiki = [c for c in required_teiki if c not in df_teiki.columns]
+        if missing_teiki:
+            notes.append(f"⚠️ 定期受注データに必須列がありません: {missing_teiki}。停止件数は計算できません。")
+        else:
+            teiki_first = df_teiki[df_teiki[teiki_kaisu_col] == 1].copy()
+            teiki_first = teiki_first.merge(
+                customer_master[[customer_col, "登録月"]], on=customer_col, how="left"
+            )
+            n_no_cohort = teiki_first["登録月"].isna().sum()
+            if n_no_cohort > 0:
+                notes.append(
+                    f"⚠️ 定期受注データのうち{n_no_cohort}件は、登録月が特定できず"
+                    f"（受注データに同一顧客番号が見つからない）停止件数の集計から除外しました。"
+                )
+            stopped = teiki_first[
+                (teiki_first[teiki_status_col] == "停止") & teiki_first["登録月"].notna()
+            ]
+            stopped_by_month = stopped.groupby("登録月").size()
+    else:
+        notes.append(
+            "ℹ️ 定期受注データがアップロードされていないため、「停止件数」は集計していません"
+            "（受注データのみでは判定できない項目のため）。"
+        )
+
     rows = []
     for month, sub in first_orders.groupby("登録月"):
         shipped_count = int(sub[shipped_date_col].notna().sum())
         cancelled = sub[sub[taiou_col] == "キャンセル"].copy()
         cancelled_count = len(cancelled)
+        stopped_count = int(stopped_by_month.get(month, 0)) if stopped_by_month is not None else None
         payment_error_count = int(sub[kessai_col].isin(PAYMENT_ERROR_STATUSES).sum())
 
         n_missing_date = cancelled["_経過日数"].isna().sum()
@@ -575,6 +613,7 @@ def calculate_period_cancellation(
             "登録月": month,
             "出荷件数": shipped_count,
             "キャンセル件数": cancelled_count,
+            "停止件数": stopped_count,
             "決済保留エラー件数": payment_error_count,
             "7日以内解約件数": within_7,
             "7日以内解約率": rate_7,
@@ -1262,6 +1301,40 @@ st.set_page_config(page_title="KPIレポート作成システム", layout="wide"
 
 REQUIRED_ORDER_COLUMNS = ["顧客番号", "受注日", "定期回数", "対応状況", "決済状況", "合計"]
 
+
+# --------------------------------------------------------------------
+# パスワードゲート（合言葉を知っている人だけアクセス可能にする）
+# --------------------------------------------------------------------
+def check_password() -> bool:
+    """
+    合言葉方式の簡易認証。
+    合言葉は .streamlit/secrets.toml の app_password に設定する（Streamlit Community Cloudでは
+    ダッシュボードの Secrets 設定画面から登録すればコードやGitHubに書く必要はない）。
+    設定ファイルが存在しない場合（ローカルでの動作確認時など）は認証をスキップする。
+    """
+    try:
+        correct_password = st.secrets["app_password"]
+    except Exception:
+        # secrets.tomlが無い＝ローカル動作確認用。認証なしで通す。
+        return True
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.title("📊 KPIレポート作成システム")
+    st.text_input("合言葉を入力してください", type="password", key="password_input")
+    if st.button("入室する"):
+        if st.session_state.get("password_input", "") == correct_password:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("合言葉が違います。")
+    return False
+
+
+if not check_password():
+    st.stop()
+
 st.title("📊 KPIレポート作成システム")
 st.caption("左のサイドバーで必要なデータをまとめてアップロードしてください。アップロード後、上部のタブでKPIを自由に切り替えられます。")
 
@@ -1355,20 +1428,54 @@ def prepare_continuation(files_all, files_ari, files_nashi):
 
 # --------------------------------------------------------------------
 # データ読み込み（アップロードされているものだけ処理する）
+# 新規アップロードがあればサーバー側に保存し、次回以降アップロードなしでも
+# 最後に保存されたデータを自動で表示する（＝誰かが更新すれば全員に反映される）
 # --------------------------------------------------------------------
+LATEST_DIR = Path(__file__).resolve().parent / "latest_data"
+LATEST_DIR.mkdir(exist_ok=True)
+
+PATH_ORDER_COHORT = LATEST_DIR / "order_with_cohort.pkl"
+PATH_ORDER_MASTER = LATEST_DIR / "order_master.pkl"
+PATH_TEIKI = LATEST_DIR / "teiki.pkl"
+PATH_CONTINUATION = LATEST_DIR / "continuation.pkl"
+
+
+def _saved_at(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+
 df_with_cohort, master, order_notes = (pd.DataFrame(), pd.DataFrame(), [])
 if order_files:
     df_with_cohort, master, order_notes = prepare_orders(order_files)
+    if not df_with_cohort.empty:
+        df_with_cohort.to_pickle(PATH_ORDER_COHORT)
+        master.to_pickle(PATH_ORDER_MASTER)
+elif PATH_ORDER_COHORT.exists():
+    df_with_cohort = pd.read_pickle(PATH_ORDER_COHORT)
+    master = pd.read_pickle(PATH_ORDER_MASTER)
+    st.sidebar.caption(f"📌 受注データ：保存済み（{_saved_at(PATH_ORDER_COHORT)}時点）を表示中")
 
 df_teiki, teiki_notes = (pd.DataFrame(), [])
 if teiki_files:
     df_teiki, teiki_notes = prepare_teiki(teiki_files)
+    if not df_teiki.empty:
+        df_teiki.to_pickle(PATH_TEIKI)
+elif PATH_TEIKI.exists():
+    df_teiki = pd.read_pickle(PATH_TEIKI)
+    st.sidebar.caption(f"📌 定期受注データ：保存済み（{_saved_at(PATH_TEIKI)}時点）を表示中")
 
 df_continuation, cont_notes = (pd.DataFrame(), [])
 if continuation_files_all or continuation_files_ari or continuation_files_nashi:
     df_continuation, cont_notes = prepare_continuation(
         continuation_files_all, continuation_files_ari, continuation_files_nashi
     )
+    if not df_continuation.empty:
+        df_continuation.to_pickle(PATH_CONTINUATION)
+elif PATH_CONTINUATION.exists():
+    df_continuation = pd.read_pickle(PATH_CONTINUATION)
+    st.sidebar.caption(f"📌 継続率データ：保存済み（{_saved_at(PATH_CONTINUATION)}時点）を表示中")
 
 if df_with_cohort.empty and df_teiki.empty and df_continuation.empty:
     st.info("👈 左のサイドバーから、まずは受注データ／定期受注データ／継続率データをアップロードしてください。")
@@ -1403,6 +1510,8 @@ st.divider()
 # --------------------------------------------------------------------
 # タブでKPIを切り替え表示
 # --------------------------------------------------------------------
+kpi_results = {}  # 保存機能用：各タブで計算した結果をここに集約する
+
 tab_labels = [
     "①初回離脱率", "②期間別解約率", "③F2転換率", "④定期継続率",
     "⑤⑥⑦LTV等", "⑧顧客推移", "⑨稼働顧客数", "⑩RF分析", "⑪解約理由", "⑫スコアリング",
@@ -1424,6 +1533,7 @@ with tabs[0]:
         st.info("受注データをアップロードしてください。")
     else:
         result, kpi_notes = calculate_first_time_churn(df_with_cohort)
+        kpi_results["01_初回離脱率"] = result
         render_notes(kpi_notes)
         if not result.empty:
             display_df = result.copy()
@@ -1445,10 +1555,11 @@ with tabs[1]:
     st.header("② 期間別解約率")
     st.markdown(
         """
-        **定義**：定期回数=1（真の初回購入）を対象に、出荷・キャンセル・決済保留エラーの件数と、
+        **定義**：定期回数=1（真の初回購入）を対象に、出荷・キャンセル・停止・決済保留エラーの件数と、
         キャンセルが「出荷予定日から何日以内に発生したか」を集計。
         - **出荷件数**：「発送日」に実データが入っている件数
-        - **キャンセル件数**：「対応状況」＝キャンセル の件数
+        - **キャンセル件数**：受注データの「対応状況」＝キャンセル の件数
+        - **停止件数**：定期受注データの「ステータス」＝停止 の件数（要：定期受注データのアップロード）
         - **決済保留エラー件数**：与信保留／与信審査エラー／仮売上失敗／取引修正失敗（別枠並列集計）
         - **期間別解約**：「発送予定日」を出荷日とみなし、「更新日」との差分日数で7日/14日以内を集計
         """
@@ -1456,16 +1567,24 @@ with tabs[1]:
     if df_with_cohort.empty:
         st.info("受注データをアップロードしてください。")
     else:
-        result, kpi_notes = calculate_period_cancellation(df_with_cohort)
+        if df_teiki.empty:
+            st.caption("ℹ️ 定期受注データもアップロードすると「停止件数」も集計されます。")
+        result, kpi_notes = calculate_period_cancellation(df_with_cohort, df_teiki, master)
+        kpi_results["02_期間別解約率"] = result
         render_notes(kpi_notes)
         if not result.empty:
             display_df = result.copy()
             for c in ["7日以内解約率", "14日以内解約率"]:
                 display_df[c] = display_df[c].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "―")
+            if display_df["停止件数"].isna().all():
+                display_df["停止件数"] = "―"
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+            chart_cols = ["出荷件数", "キャンセル件数", "決済保留エラー件数"]
+            if result["停止件数"].notna().any():
+                chart_cols.insert(2, "停止件数")
             fig = px.bar(
-                result, x="登録月", y=["出荷件数", "キャンセル件数", "決済保留エラー件数"],
-                barmode="group", title="登録月別 出荷・キャンセル・決済保留エラー件数",
+                result, x="登録月", y=chart_cols,
+                barmode="group", title="登録月別 出荷・キャンセル・停止・決済保留エラー件数",
             )
             st.plotly_chart(fig, use_container_width=True)
             download_buttons(result, "kpi02_期間別解約率", "期間別解約率")
@@ -1483,6 +1602,7 @@ with tabs[2]:
         st.info("継続率データ（全体／縛りあり／縛りなし）をアップロードしてください。")
     else:
         result, kpi_notes = calculate_f2_conversion(df_continuation)
+        kpi_results["03_F2転換率"] = result
         render_notes(kpi_notes)
         if not result.empty:
             tab_kakutei, tab_mikakutei = st.tabs(["売上確定", "売上未確定含む"])
@@ -1505,24 +1625,31 @@ with tabs[2]:
 # ④ 定期継続率
 with tabs[3]:
     st.header("④ 定期継続率")
-    st.markdown("**定義**：n回目→n+1回目への継続割合。継続率データCSVの数値を**そのまま使用**。")
+    st.markdown(
+        "**定義**：n回目→n+1回目への継続割合。継続率データCSV（全体）の数値を**そのまま使用**。"
+        "（縛りあり/縛りなしの内訳を見たい場合は③F2転換率タブをご参照ください）"
+    )
     if df_continuation.empty:
-        st.info("継続率データ（全体／縛りあり／縛りなし）をアップロードしてください。")
+        st.info("継続率データ（全体）をアップロードしてください。")
     else:
         result, kpi_notes = build_continuation_table(df_continuation)
+        kpi_results["04_定期継続率"] = result
         render_notes(kpi_notes)
-        if not result.empty:
+        result_all = result[result["区分"] == "全体"].drop(columns=["区分"])
+        if not result_all.empty:
             tab_kakutei, tab_mikakutei = st.tabs(["売上確定", "売上未確定含む"])
             with tab_kakutei:
-                d = result[["登録月", "区分", "n~n+1回", "合計（件）", "売上済（件）", "離脱（件）", "継続率（確定）"]].copy()
+                d = result_all[["登録月", "n~n+1回", "合計（件）", "売上済（件）", "離脱（件）", "継続率（確定）"]].copy()
                 d["継続率（確定）"] = d["継続率（確定）"].apply(lambda x: f"{x:.2f}%")
                 st.dataframe(d, use_container_width=True, hide_index=True)
             with tab_mikakutei:
-                d = result[["登録月", "区分", "n~n+1回", "合計（件）", "売上済（件）", "売上前（件）",
-                            "待機中（件）", "離脱（件）", "継続率（未確定含む）"]].copy()
+                d = result_all[["登録月", "n~n+1回", "合計（件）", "売上済（件）", "売上前（件）",
+                                 "待機中（件）", "離脱（件）", "継続率（未確定含む）"]].copy()
                 d["継続率（未確定含む）"] = d["継続率（未確定含む）"].apply(lambda x: f"{x:.2f}%")
                 st.dataframe(d, use_container_width=True, hide_index=True)
-            download_buttons(result, "kpi04_定期継続率", "定期継続率")
+            download_buttons(result_all, "kpi04_定期継続率", "定期継続率")
+        else:
+            st.info("「全体」区分の継続率データが見つかりませんでした。")
 
 # ⑤⑥⑦ LTV・平均購入回数・アップセル率
 with tabs[4]:
@@ -1539,6 +1666,7 @@ with tabs[4]:
         st.info("受注データをアップロードしてください。")
     else:
         result, kpi_notes = calculate_ltv_purchase_upsell(df_with_cohort)
+        kpi_results["05_06_07_LTV_購入回数_アップセル率"] = result
         render_notes(kpi_notes)
         if not result.empty:
             display_df = result.copy()
@@ -1574,6 +1702,7 @@ with tabs[5]:
         target_months = st.multiselect("対象月を選択", options=available_months, default=available_months, key="kpi08_months")
         if target_months:
             result, kpi_notes = build_customer_trend(df_with_cohort, df_teiki, target_months)
+            kpi_results["08_顧客推移データ"] = result
             render_notes(kpi_notes)
             if not result.empty:
                 pivot_n = result.pivot_table(index=["状態", "属性"], columns="対象月", values="人数", aggfunc="sum")
@@ -1601,6 +1730,7 @@ with tabs[6]:
     else:
         asof_ts = pd.Timestamp(asof_date)
         overall, by_cohort, kpi_notes = calculate_active_customers(df_with_cohort, master, asof_ts)
+        kpi_results["09_稼働顧客数"] = by_cohort
         render_notes(kpi_notes)
         if overall:
             c1, c2, c3 = st.columns(3)
@@ -1626,6 +1756,7 @@ with tabs[7]:
     else:
         asof_ts = pd.Timestamp(asof_date)
         matrix, kpi_notes = calculate_rf_matrix(master, df_with_cohort, asof_ts)
+        kpi_results["10_RF分析"] = matrix.fillna(0).astype(int) if not matrix.empty else matrix
         render_notes(kpi_notes)
         if not matrix.empty:
             st.caption(f"基準日：{asof_ts.strftime('%Y-%m-%d')}")
@@ -1645,6 +1776,7 @@ with tabs[8]:
         st.info("定期受注データをアップロードしてください。")
     else:
         result, kpi_notes = calculate_cancel_reasons(df_teiki)
+        kpi_results["11_解約理由"] = result
         render_notes(kpi_notes)
         if not result.empty:
             display_df = result.copy()
@@ -1666,6 +1798,7 @@ with tabs[9]:
         st.info("受注データをアップロードしてください。")
     else:
         result, kpi_notes = calculate_customer_scoring(df_with_cohort)
+        kpi_results["12_スコアリング"] = result
         render_notes(kpi_notes)
         if not result.empty:
             display_df = result.copy()
@@ -1680,3 +1813,97 @@ with tabs[9]:
             with c2:
                 st.plotly_chart(px.pie(result, names="顧客分類", values="累積売上", title="顧客分類別 売上構成比"), use_container_width=True)
             download_buttons(result, "kpi12_スコアリング", "スコアリング")
+
+# ======================================================================
+# レポート保存機能（バックナンバー保存）
+# ======================================================================
+st.divider()
+st.header("📁 レポート保存（バックナンバー）")
+st.caption(
+    "現在計算されている①〜⑫の結果を1つのExcelファイルにまとめて、"
+    "このapp.pyと同じフォルダの「saved_reports」フォルダに保存します。"
+    "日付タイトルで管理すれば、データを取得するたびの記録として残せます。"
+)
+
+SAVE_DIR = Path(__file__).resolve().parent / "saved_reports"
+SAVE_DIR.mkdir(exist_ok=True)
+
+KPI_SHEET_LABELS = {
+    "01_初回離脱率": "①初回離脱率",
+    "02_期間別解約率": "②期間別解約率",
+    "03_F2転換率": "③F2転換率",
+    "04_定期継続率": "④定期継続率",
+    "05_06_07_LTV_購入回数_アップセル率": "⑤⑥⑦LTV等",
+    "08_顧客推移データ": "⑧顧客推移データ",
+    "09_稼働顧客数": "⑨稼働顧客数",
+    "10_RF分析": "⑩RF分析",
+    "11_解約理由": "⑪解約理由",
+    "12_スコアリング": "⑫スコアリング",
+}
+
+
+def build_full_report_excel(results: dict) -> bytes:
+    """kpi_resultsの中身を1つのExcelファイル（複数シート）にまとめる。"""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        wrote_any = False
+        for key, label in KPI_SHEET_LABELS.items():
+            df = results.get(key)
+            if df is not None and not df.empty:
+                df.to_excel(writer, sheet_name=label[:31], index=(df.index.name is not None))
+                wrote_any = True
+        if not wrote_any:
+            pd.DataFrame({"note": ["保存対象のデータがありません"]}).to_excel(writer, sheet_name="empty", index=False)
+    return buf.getvalue()
+
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    return name or datetime.date.today().strftime("%Y%m%d")
+
+
+save_col1, save_col2 = st.columns([2, 1])
+with save_col1:
+    default_title = datetime.date.today().strftime("%Y%m%d")
+    save_title = st.text_input("保存名（例：20260702）", value=default_title, key="save_title")
+with save_col2:
+    st.write("")
+    st.write("")
+    save_clicked = st.button("💾 この内容を保存する", use_container_width=True)
+
+if save_clicked:
+    safe_name = sanitize_filename(save_title)
+    non_empty_count = sum(1 for df in kpi_results.values() if df is not None and not df.empty)
+    if non_empty_count == 0:
+        st.error("保存できるKPI結果がありません。データをアップロードしてから保存してください。")
+    else:
+        excel_bytes = build_full_report_excel(kpi_results)
+        save_path = SAVE_DIR / f"{safe_name}.xlsx"
+        if save_path.exists():
+            st.warning(f"「{safe_name}.xlsx」は既に存在します。上書きしました。")
+        with open(save_path, "wb") as f:
+            f.write(excel_bytes)
+        st.success(f"✅ 保存しました：saved_reports/{safe_name}.xlsx（{non_empty_count}件のKPIを含む）")
+
+# 過去の保存レポート一覧
+st.subheader("📂 過去の保存レポート")
+saved_files = sorted(SAVE_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+if not saved_files:
+    st.caption("まだ保存されたレポートはありません。")
+else:
+    for path in saved_files:
+        col_a, col_b, col_c = st.columns([3, 2, 1])
+        with col_a:
+            st.write(f"📄 {path.stem}")
+        with col_b:
+            mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+            st.caption(f"保存日時：{mtime.strftime('%Y-%m-%d %H:%M')}")
+        with col_c:
+            with open(path, "rb") as f:
+                st.download_button(
+                    "📥 開く", data=f.read(), file_name=path.name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_saved_{path.stem}",
+                )
